@@ -1,0 +1,334 @@
+diff -rupNEZbB original/usr/src/minix/include/minix/callnr.h task/usr/src/minix/include/minix/callnr.h
+--- original/usr/src/minix/include/minix/callnr.h	2022-06-10 18:15:24.984912323 +0200
++++ task/usr/src/minix/include/minix/callnr.h	2022-06-10 18:28:55.487876146 +0200
+@@ -118,7 +118,8 @@
+ #define VFS_COPYFD		(VFS_BASE + 46)
+ #define VFS_CHECKPERMS		(VFS_BASE + 47)
+ #define VFS_GETSYSINFO		(VFS_BASE + 48)
++#define VFS_NOTIFY		(VFS_BASE + 49)
+ 
+-#define NR_VFS_CALLS		49	/* highest number from base plus one */
++#define NR_VFS_CALLS		50	/* highest number from base plus one */
+ 
+ #endif /* !_MINIX_CALLNR_H */
+diff -rupNEZbB original/usr/src/minix/include/minix/ipc.h task/usr/src/minix/include/minix/ipc.h
+--- original/usr/src/minix/include/minix/ipc.h	2022-06-10 18:15:24.984912323 +0200
++++ task/usr/src/minix/include/minix/ipc.h	2022-06-10 18:28:55.475876040 +0200
+@@ -842,6 +842,14 @@ typedef struct {
+ _ASSERT_MSG_SIZE(mess_lc_vfs_umount);
+ 
+ typedef struct {
++	int fd;
++	int event;
++
++	uint8_t data[48];
++} mess_lc_vfs_notify;
++_ASSERT_MSG_SIZE(mess_lc_vfs_notify);
++
++typedef struct {
+ 	void		*addr;
+ 	uint8_t		padding[52];
+ } mess_lc_vm_brk;
+@@ -2121,6 +2129,7 @@ typedef struct {
+ 		mess_lc_vfs_truncate	m_lc_vfs_truncate;
+ 		mess_lc_vfs_umask	m_lc_vfs_umask;
+ 		mess_lc_vfs_umount	m_lc_vfs_umount;
++        mess_lc_vfs_notify	m_lc_vfs_notify;
+ 		mess_lc_vm_brk		m_lc_vm_brk;
+ 		mess_lc_vm_getphys	m_lc_vm_getphys;
+ 		mess_lc_vm_rusage	m_lc_vm_rusage;
+diff -rupNEZbB original/usr/src/minix/servers/vfs/const.h task/usr/src/minix/servers/vfs/const.h
+--- original/usr/src/minix/servers/vfs/const.h	2022-06-10 18:15:25.020912633 +0200
++++ task/usr/src/minix/servers/vfs/const.h	2022-06-15 22:58:09.464081367 +0200
+@@ -7,6 +7,7 @@
+ #define NR_MNTS           16 	/* # slots in mount table */
+ #define NR_VNODES       1024	/* # slots in vnode table */
+ #define NR_WTHREADS	   9	/* # slots in worker thread table */
++#define NR_NOTIFY          8	/* # slots in notify table */
+ 
+ #define NR_NONEDEVS	NR_MNTS	/* # slots in nonedev bitmap */
+ 
+@@ -22,6 +23,8 @@
+ #define FP_BLOCKED_ON_SELECT	4 /* susp'd on select */
+ #define FP_BLOCKED_ON_OTHER	5 /* blocked on other process, check
+ 				     fp_task to find out */
++#define FP_BLOCKED_ON_NOTIFY_OPEN	    6 /* susp'd on notify open */
++#define FP_BLOCKED_ON_NOTIFY_TRIOPEN	7 /* susp'd on notify triopen */
+ 
+ /* test if the process is blocked on something */
+ #define fp_is_blocked(fp)	((fp)->fp_blocked_on != FP_BLOCKED_ON_NONE)
+diff -rupNEZbB original/usr/src/minix/servers/vfs/glo.h task/usr/src/minix/servers/vfs/glo.h
+--- original/usr/src/minix/servers/vfs/glo.h	2022-06-10 18:15:25.020912633 +0200
++++ task/usr/src/minix/servers/vfs/glo.h	2022-06-15 22:57:03.370788931 +0200
+@@ -47,4 +47,6 @@ extern int (* const call_vec[])(void);
+ 
+ EXTERN struct kinfo kinfo;     /* kernel information */
+ 
++EXTERN int monitored;		/* number of monitored procs */
++
+ #endif
+diff -rupNEZbB original/usr/src/minix/servers/vfs/Makefile task/usr/src/minix/servers/vfs/Makefile
+--- original/usr/src/minix/servers/vfs/Makefile	2022-06-10 18:15:25.020912633 +0200
++++ task/usr/src/minix/servers/vfs/Makefile	2022-06-10 18:31:36.460781155 +0200
+@@ -7,7 +7,8 @@ SRCS=	main.c open.c read.c write.c pipe.
+ 	filedes.c stadir.c protect.c time.c \
+ 	lock.c misc.c utility.c select.c table.c \
+ 	vnode.c vmnt.c request.c \
+-	tll.c comm.c worker.c coredump.c
++	tll.c comm.c worker.c coredump.c \
++    notify.c
+ 
+ .if ${MKCOVERAGE} != "no"
+ SRCS+=  gcov.c
+diff -rupNEZbB original/usr/src/minix/servers/vfs/notify.c task/usr/src/minix/servers/vfs/notify.c
+--- original/usr/src/minix/servers/vfs/notify.c	1970-01-01 01:00:00.000000000 +0100
++++ task/usr/src/minix/servers/vfs/notify.c	2022-06-15 23:46:22.397634696 +0200
+@@ -0,0 +1,64 @@
++#include "fs.h"
++#include "const.h"
++#include "file.h"
++#include "vnode.h"
++#include "glo.h"
++#include "scratchpad.h"
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <stdbool.h>
++
++#define THREE 3
++
++bool file_is_simultaneously_opened_less_than_three_times(struct filp *filp)
++{
++    struct vnode *vp = filp->filp_vno;
++    return vp->v_ref_count < THREE;
++}
++
++int do_notify(void)
++{
++    int fd = m_in.m_lc_vfs_notify.fd;
++    int event = m_in.m_lc_vfs_notify.event;
++
++    if (monitored + 1 > NR_NOTIFY)
++    {
++        /* limit would be exceeded */
++        return ENONOTIFY;
++    }
++
++    struct filp *filp;
++    if ( (filp = get_filp(fd, VNODE_NONE)) == NULL)
++    {
++        return(err_code);
++    }
++
++    switch (event)
++    {
++        case NOTIFY_OPEN:
++            scratch(fp).file.fd_nr = fd;
++            suspend(FP_BLOCKED_ON_NOTIFY_OPEN);
++            return(SUSPEND);
++
++        case NOTIFY_TRIOPEN:
++            if (file_is_simultaneously_opened_less_than_three_times(filp))
++            {
++                scratch(fp).file.fd_nr = fd;
++                suspend(FP_BLOCKED_ON_NOTIFY_TRIOPEN);
++                return (SUSPEND);
++            }
++            else
++            {
++                return(OK);
++            }
++
++        case NOTIFY_CREATE:
++        case NOTIFY_MOVE:
++            return(EINVAL);
++
++        default:
++            return(EINVAL);
++    }
++
++    return(ENOSYS);
++}
+diff -rupNEZbB original/usr/src/minix/servers/vfs/open.c task/usr/src/minix/servers/vfs/open.c
+--- original/usr/src/minix/servers/vfs/open.c	2022-06-10 18:15:25.020912633 +0200
++++ task/usr/src/minix/servers/vfs/open.c	2022-06-15 23:01:40.457910816 +0200
+@@ -266,6 +266,10 @@ int common_open(char path[PATH_MAX], int
+ 	}
+   }
+ 
++  if (r == OK && oflags == 0) {
++      revive_monitored(filp->filp_vno, VFS_NOTIFY);
++  }
++
+   unlock_filp(filp);
+ 
+   /* If error, release inode. */
+diff -rupNEZbB original/usr/src/minix/servers/vfs/pipe.c task/usr/src/minix/servers/vfs/pipe.c
+--- original/usr/src/minix/servers/vfs/pipe.c	2022-06-10 18:15:25.020912633 +0200
++++ task/usr/src/minix/servers/vfs/pipe.c	2022-06-15 23:22:13.169831382 +0200
+@@ -31,6 +31,7 @@
+ #include <minix/vfsif.h>
+ #include "vnode.h"
+ #include "vmnt.h"
++#include <stdbool.h>
+ 
+ static int create_pipe(int fil_des[2], int flags);
+ 
+@@ -305,6 +306,10 @@ void suspend(int why)
+ 	/* #procs susp'ed on pipe*/
+ 	susp_count++;
+ 
++  if (why == FP_BLOCKED_ON_NOTIFY_OPEN || why == FP_BLOCKED_ON_NOTIFY_TRIOPEN)
++    /* #procs susp'ed on notify*/
++    monitored++;
++
+   fp->fp_blocked_on = why;
+   assert(fp->fp_grant == GRANT_INVALID || !GRANT_VALID(fp->fp_grant));
+   fp->fp_block_callnr = job_call_nr;
+@@ -369,7 +374,7 @@ void unsuspend_by_endpt(endpoint_t proc_
+  *===========================================================================*/
+ void release(vp, op, count)
+ register struct vnode *vp;	/* inode of pipe */
+-int op;				/* VFS_READ, VFS_WRITE, or VFS_OPEN */
++int op;				/* VFS_READ, VFS_WRITE, VFS_OPEN, or VFS_NOTIFY */
+ int count;			/* max number of processes to release */
+ {
+ /* Check to see if any process is hanging on vnode 'vp'. If one is, and it
+@@ -407,6 +412,7 @@ int count;			/* max number of processes
+ 		/* Find the vnode. Depending on the reason the process was
+ 		 * suspended, there are different ways of finding it.
+ 		 */
++        bool fp_blocked_on_notify = false;
+ 
+ 		if (rp->fp_blocked_on == FP_BLOCKED_ON_POPEN ||
+ 		    rp->fp_blocked_on == FP_BLOCKED_ON_LOCK ||
+@@ -421,19 +427,45 @@ int count;			/* max number of processes
+ 				continue;
+ 			if (scratch(rp).file.filp->filp_vno != vp)
+ 				continue;
++		} else if (rp->fp_blocked_on == FP_BLOCKED_ON_NOTIFY_OPEN ||
++                   (rp->fp_blocked_on == FP_BLOCKED_ON_NOTIFY_TRIOPEN &&
++                    vp->v_ref_count >= 3)) {
++            fp_blocked_on_notify = true;
++            f = rp->fp_filp[scratch(rp).file.fd_nr];
++            if (f == NULL || f->filp_mode == FILP_CLOSED)
++                continue;
++            if (rp->fp_filp[scratch(rp).file.fd_nr]->filp_vno != vp)
++                continue;
+ 		} else
+ 			continue;
+ 
+ 		/* We found the vnode. Revive process. */
+ 		revive(rp->fp_endpoint, 0);
++        if (!fp_blocked_on_notify) {
+ 		susp_count--;	/* keep track of who is suspended */
+-		if(susp_count < 0)
++            if (susp_count < 0)
+ 			panic("susp_count now negative: %d", susp_count);
++        } else {
++            monitored--;    /* keep track of who is monitored */
++            if(monitored < 0)
++                panic("monitored now negative: %d", monitored);
++        }
+ 		if (--count == 0) return;
+ 	}
+   }
+ }
+ 
++/*===========================================================================*
++ *				revive_monitored					     *
++ *===========================================================================*/
++void revive_monitored(vp, why)
++register struct vnode *vp;
++int why;
++{
++/* Revive monitored processes. */
++    release(vp, why, monitored);
++}
++
+ 
+ /*===========================================================================*
+  *				revive					     *
+@@ -470,7 +502,9 @@ void revive(endpoint_t proc_e, int retur
+ 	if (blocked_on == FP_BLOCKED_ON_POPEN) {
+ 		/* process blocked in open or create */
+ 		replycode(proc_e, fd_nr);
+-	} else if (blocked_on == FP_BLOCKED_ON_SELECT) {
++	} else if (blocked_on == FP_BLOCKED_ON_SELECT ||
++               blocked_on == FP_BLOCKED_ON_NOTIFY_OPEN ||
++               blocked_on == FP_BLOCKED_ON_NOTIFY_TRIOPEN) {
+ 		replycode(proc_e, returned);
+ 	} else {
+ 		/* Revive a process suspended on TTY or other device.
+@@ -559,6 +593,12 @@ void unpause(void)
+ 		status = cdev_cancel(dev);
+ 
+ 		break;
++
++    case FP_BLOCKED_ON_NOTIFY_OPEN:
++    case FP_BLOCKED_ON_NOTIFY_TRIOPEN:
++        monitored--;
++        break;
++
+ 	default :
+ 		panic("VFS: unknown block reason: %d", blocked_on);
+   }
+diff -rupNEZbB original/usr/src/minix/servers/vfs/proto.h task/usr/src/minix/servers/vfs/proto.h
+--- original/usr/src/minix/servers/vfs/proto.h	2022-06-10 18:15:25.020912633 +0200
++++ task/usr/src/minix/servers/vfs/proto.h	2022-06-15 22:38:03.055625146 +0200
+@@ -167,6 +167,7 @@ void unpause(void);
+ int pipe_check(struct filp *filp, int rw_flag, int oflags, int bytes,
+ 	int notouch);
+ void release(struct vnode *vp, int op, int count);
++void revive_monitored(struct vnode *vp, int why);
+ void revive(endpoint_t proc_e, int returned);
+ void suspend(int why);
+ void pipe_suspend(struct filp *rfilp, vir_bytes buf, size_t size);
+@@ -348,4 +349,7 @@ void worker_wait(void);
+ struct worker_thread *worker_suspend(void);
+ void worker_resume(struct worker_thread *org_self);
+ void worker_set_proc(struct fproc *rfp);
++
++/* notify.c */
++int do_notify(void);
+ #endif
+diff -rupNEZbB original/usr/src/minix/servers/vfs/table.c task/usr/src/minix/servers/vfs/table.c
+--- original/usr/src/minix/servers/vfs/table.c	2022-06-10 18:15:25.020912633 +0200
++++ task/usr/src/minix/servers/vfs/table.c	2022-06-10 18:35:26.673338216 +0200
+@@ -65,4 +65,5 @@ int (* const call_vec[NR_VFS_CALLS])(voi
+ 	CALL(VFS_COPYFD)	= do_copyfd,		/* copyfd(2) */
+ 	CALL(VFS_CHECKPERMS)	= do_checkperms,	/* checkperms(2) */
+ 	CALL(VFS_GETSYSINFO)	= do_getsysinfo,	/* getsysinfo(2) */
++    CALL(VFS_NOTIFY)	= do_notify,		/* notify() */
+ };
+diff -rupNEZbB original/usr/src/sys/sys/errno.h task/usr/src/sys/sys/errno.h
+--- original/usr/src/sys/sys/errno.h	2022-05-27 15:08:19.000000000 +0200
++++ task/usr/src/sys/sys/errno.h	2022-06-10 18:50:50.759000000 +0200
+@@ -172,7 +172,9 @@
+ #define	ENOLINK		(_SIGN 95 )		/* Link has been severed */
+ #define	EPROTO		(_SIGN 96 )		/* Protocol error */
+ 
+-#define	ELAST		(_SIGN 96 )		/* Must equal largest errno */
++#define	ENONOTIFY		(_SIGN 97 )		/* No more notifications available */
++
++#define	ELAST		(_SIGN 97 )		/* Must equal largest errno */
+ 
+ #if defined(_KERNEL) || defined(_KMEMUSER)
+ /* pseudo-errors returned inside kernel to modify return to process */
+diff -rupNEZbB original/usr/src/sys/sys/fcntl.h task/usr/src/sys/sys/fcntl.h
+--- original/usr/src/sys/sys/fcntl.h	2022-05-27 15:08:19.000000000 +0200
++++ task/usr/src/sys/sys/fcntl.h	2022-06-10 18:50:50.771000000 +0200
+@@ -301,6 +301,14 @@ struct flock {
+ #define	AT_REMOVEDIR		0x800	/* Remove directory only */
+ #endif
+ 
++/*
++ * Event flags used by notify()
++ */
++#define	NOTIFY_OPEN	0x00000001	/* file is opened */
++#define	NOTIFY_TRIOPEN	0x00000002	/* file is opened >= 3 times simultaneously */
++#define	NOTIFY_CREATE	0x00000004	/* file is created in the directory */
++#define	NOTIFY_MOVE	0x00000008	/* file is moved to the directory */
++
+ 
+ #ifndef _KERNEL
+ #include <sys/cdefs.h>

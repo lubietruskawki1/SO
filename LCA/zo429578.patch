@@ -1,0 +1,242 @@
+diff -rupNEZbB original/usr/include/minix/callnr.h task/usr/include/minix/callnr.h
+--- original/usr/include/minix/callnr.h	2022-05-07 14:02:09.160703530 +0200
++++ task/usr/include/minix/callnr.h	2022-05-08 12:28:38.961977135 +0200
+@@ -58,8 +58,9 @@
+ #define PM_GETEPINFO		(PM_BASE + 45)
+ #define PM_GETPROCNR		(PM_BASE + 46)
+ #define PM_GETSYSINFO		(PM_BASE + 47)
++#define PM_GETLCAPID        (PM_BASE + 48)
+ 
+-#define NR_PM_CALLS		48	/* highest number from base plus one */
++#define NR_PM_CALLS		49	/* highest number from base plus one */
+ 
+ /*===========================================================================*
+  *				Calls to VFS				     *
+diff -rupNEZbB original/usr/include/unistd.h task/usr/include/unistd.h
+--- original/usr/include/unistd.h	2022-05-07 14:02:09.176703550 +0200
++++ task/usr/include/unistd.h	2022-05-10 11:17:09.622396729 +0200
+@@ -411,5 +411,7 @@ extern	 int optreset;		/* getopt(3) exte
+ extern	 char *suboptarg;	/* getsubopt(3) external variable */
+ #endif
+ 
++pid_t getlcapid(pid_t pid_1, pid_t pid_2);
++
+ __END_DECLS
+ #endif /* !_UNISTD_H_ */
+diff -rupNEZbB original/usr/src/include/unistd.h task/usr/src/include/unistd.h
+--- original/usr/src/include/unistd.h	2022-05-07 14:02:09.184703560 +0200
++++ task/usr/src/include/unistd.h	2022-05-10 11:17:09.626396107 +0200
+@@ -411,5 +411,7 @@ extern	 int optreset;		/* getopt(3) exte
+ extern	 char *suboptarg;	/* getsubopt(3) external variable */
+ #endif
+ 
++pid_t getlcapid(pid_t pid_1, pid_t pid_2);
++
+ __END_DECLS
+ #endif /* !_UNISTD_H_ */
+diff -rupNEZbB original/usr/src/lib/libc/misc/getlcapid.c task/usr/src/lib/libc/misc/getlcapid.c
+--- original/usr/src/lib/libc/misc/getlcapid.c	1970-01-01 01:00:00.000000000 +0100
++++ task/usr/src/lib/libc/misc/getlcapid.c	2022-05-11 20:20:32.448282842 +0200
+@@ -0,0 +1,30 @@
++#include <lib.h>
++#include <minix/rs.h>
++
++int get_pm_endpt(endpoint_t *pt)
++{
++    return minix_rs_lookup("pm", pt);
++}
++
++
++pid_t getlcapid(pid_t pid_1, pid_t pid_2)
++{
++    endpoint_t pm_pt;
++    message m;
++
++    if (get_pm_endpt(&pm_pt) != 0)
++    {
++        errno = ENOSYS;
++        return -1;
++    }
++
++    m.m1_i1 = pid_1;
++    m.m1_i2 = pid_2;
++
++    if (_syscall(pm_pt, PM_GETLCAPID, &m) != 0)
++    {
++        return -1;
++    }
++
++    return m.m1_i3;
++}
+diff -rupNEZbB original/usr/src/lib/libc/misc/Makefile.inc task/usr/src/lib/libc/misc/Makefile.inc
+--- original/usr/src/lib/libc/misc/Makefile.inc	2022-05-07 14:02:09.216703599 +0200
++++ task/usr/src/lib/libc/misc/Makefile.inc	2022-05-10 15:10:37.251925004 +0200
+@@ -7,4 +7,4 @@
+ SRCS+=	initfini.c
+ 
+ # for -fstack-protector
+-SRCS+=	stack_protector.c
++SRCS+=	stack_protector.c getlcapid.c
+diff -rupNEZbB original/usr/src/minix/include/minix/callnr.h task/usr/src/minix/include/minix/callnr.h
+--- original/usr/src/minix/include/minix/callnr.h	2022-05-07 14:02:09.304703706 +0200
++++ task/usr/src/minix/include/minix/callnr.h	2022-05-08 12:27:51.206179258 +0200
+@@ -58,8 +58,9 @@
+ #define PM_GETEPINFO		(PM_BASE + 45)
+ #define PM_GETPROCNR		(PM_BASE + 46)
+ #define PM_GETSYSINFO		(PM_BASE + 47)
++#define PM_GETLCAPID        (PM_BASE + 48)
+ 
+-#define NR_PM_CALLS		48	/* highest number from base plus one */
++#define NR_PM_CALLS		49	/* highest number from base plus one */
+ 
+ /*===========================================================================*
+  *				Calls to VFS				     *
+diff -rupNEZbB original/usr/src/minix/servers/pm/do_getlcapid.c task/usr/src/minix/servers/pm/do_getlcapid.c
+--- original/usr/src/minix/servers/pm/do_getlcapid.c	1970-01-01 01:00:00.000000000 +0100
++++ task/usr/src/minix/servers/pm/do_getlcapid.c	2022-05-11 19:02:37.496013008 +0200
+@@ -0,0 +1,112 @@
++#include "pm.h"
++#include "mproc.h"
++#include <limits.h>
++#include <stdbool.h>
++
++#define NOT_FOUND -1
++
++/* Funkcja znajdująca w tablicy procesów mproc aktualnie działające procesy o pidach
++ * pid_1 oraz pid_2 i ustawiająca odpowiednio process_index_1 oraz process_index_2
++ * na indeksy, pod którym leży dany proces. Jeśli proces o którymś z podanych pidów
++ * nie istnieje lub jeśli nie jest aktualnie działającym procesem, funkcja ustawia
++ * wartość odpowiedniego process_index na NOT_FOUND. */
++void find_processes_indices(pid_t pid_1, pid_t pid_2, int *process_index_1,
++                                                      int *process_index_2)
++{
++    *process_index_1 = NOT_FOUND;
++    *process_index_2 = NOT_FOUND;
++    register struct mproc *rmp;
++    for (int i = 0; i < NR_PROCS; i++) {
++        rmp = &mproc[i];
++        if ((rmp->mp_flags & IN_USE) && rmp->mp_pid == pid_1) {
++            *process_index_1 = i;
++        }
++        if ((rmp->mp_flags & IN_USE) && rmp->mp_pid == pid_2) {
++            *process_index_2 = i;
++        }
++    }
++}
++
++/* Funkcja sprawdzająca, czy proces process o indeksie process_index w tablicy
++ * mproc nie ma ojca, czyli w polu mp_parent ma wpisany swój własny indeks. */
++bool is_fatherless(struct mproc *process, int process_index)
++{
++    return process->mp_parent == process_index;
++}
++
++int do_getlcapid(void)
++{
++    register struct mproc *rmp = mp;
++
++    pid_t pid_1 = m_in.m1_i1;
++    pid_t pid_2 = m_in.m1_i2;
++
++    int process_index_1;
++    int process_index_2;
++    find_processes_indices(pid_1, pid_2, &process_index_1, &process_index_2);
++
++    /* Jeśli któryś z procesów o jednym z danych identyfikatorów pid nie został
++     * odnaleziony, funkcja zwraca EINVAL. */
++    if (process_index_1 == NOT_FOUND || process_index_2 == NOT_FOUND)
++    {
++        return EINVAL;
++    }
++
++    struct mproc *process_1 = &mproc[process_index_1];
++    struct mproc *process_2 = &mproc[process_index_2];
++
++    /* Jeśli któryś z procesów nie ma ojca, to znaczy, że nie istnieje dokładnie
++     * jeden najniższy wspólny przodek, czyli funkcja zwraca ESRCH. */
++    if (is_fatherless(process_1, process_index_1) ||
++        is_fatherless(process_2, process_index_2))
++    {
++        return ESRCH;
++    }
++
++    /* Szukamy LCA danych procesów. */
++
++    /* Tablica odwiedzonych procesów, visited[i] mówi, czy proces o indeksie i
++     * w tablicy mproc został już odwiedzony. */
++    bool visited[NR_PROCS];
++    for (int i = 0; i < NR_PROCS; i++)
++    {
++        visited[i] = false;
++    }
++
++    /* Najpierw idziemy do korzenia od ojca procesu o identyfikatorze pid_1 i
++     * zaznaczamy wszystkie procesy na tej ścieżce (włącznie z ojcem i korzeniem)
++     * jako odwiedzone. Zaczynamy od ojca, ponieważ LCA musi być różny od
++     * procesów process_1 i process_2. */
++    process_index_1 = process_1->mp_parent;
++    process_1 = &mproc[process_index_1];
++
++    /* Korzeń nie ma ojca. */
++    while (!is_fatherless(process_1, process_index_1))
++    {
++        visited[process_index_1] = true;
++        process_index_1 = process_1->mp_parent;
++        process_1 = &mproc[process_index_1];
++    }
++    /* Zaznaczamy korzeń jako odwiedzony. */
++    visited[process_index_1] = true;
++
++    /* Następnie idziemy od ojca procesu o identyfikatorze pid_2 do korzenia,
++     * aż napotkamy proces, który już odwiedziliśmy. Ten proces to szukany
++     * przez nas LCA. */
++    process_index_2 = process_2->mp_parent;
++
++    /* Pętla zawsze się zatrzyma, ponieważ odwiedziliśmy korzeń. */
++    while (!visited[process_index_2])
++    {
++        process_index_2 = process_2->mp_parent;
++        process_2 = &mproc[process_index_2];
++    }
++
++    process_2 = &mproc[process_index_2];
++
++    /* W odpowiedzi podajemy pid znalezionego procesu. */
++    pid_t lca = process_2->mp_pid;
++    rmp->mp_reply.m1_i3 = lca;
++
++    return OK;
++}
+diff -rupNEZbB original/usr/src/minix/servers/pm/Makefile task/usr/src/minix/servers/pm/Makefile
+--- original/usr/src/minix/servers/pm/Makefile	2022-05-07 14:02:09.340703750 +0200
++++ task/usr/src/minix/servers/pm/Makefile	2022-05-10 13:36:40.737959882 +0200
+@@ -4,7 +4,7 @@
+ PROG=	pm
+ SRCS=	main.c forkexit.c exec.c time.c alarm.c \
+ 	signal.c utility.c table.c trace.c getset.c misc.c \
+-	profile.c mcontext.c schedule.c
++	profile.c mcontext.c schedule.c do_getlcapid.c
+ 
+ DPADD+=	${LIBSYS} ${LIBTIMERS}
+ LDADD+=	-lsys -ltimers
+diff -rupNEZbB original/usr/src/minix/servers/pm/proto.h task/usr/src/minix/servers/pm/proto.h
+--- original/usr/src/minix/servers/pm/proto.h	2022-05-07 14:02:09.340703750 +0200
++++ task/usr/src/minix/servers/pm/proto.h	2022-05-10 21:51:49.319699682 +0200
+@@ -89,3 +89,6 @@ struct mproc *find_proc(pid_t lpid);
+ int nice_to_priority(int nice, unsigned *new_q);
+ int pm_isokendpt(int ep, int *proc);
+ void tell_vfs(struct mproc *rmp, message *m_ptr);
++
++/* do_getlcapid.c */
++int do_getlcapid(void);
+diff -rupNEZbB original/usr/src/minix/servers/pm/table.c task/usr/src/minix/servers/pm/table.c
+--- original/usr/src/minix/servers/pm/table.c	2022-05-07 14:02:09.340703750 +0200
++++ task/usr/src/minix/servers/pm/table.c	2022-05-08 12:40:08.153467452 +0200
+@@ -58,5 +58,6 @@ int (* const call_vec[NR_PM_CALLS])(void
+ 	CALL(PM_EXEC_RESTART)	= do_execrestart,
+ 	CALL(PM_GETEPINFO)	= do_getepinfo,		/* getepinfo(2) */
+ 	CALL(PM_GETPROCNR)	= do_getprocnr,		/* getprocnr(2) */
+-	CALL(PM_GETSYSINFO)	= do_getsysinfo		/* getsysinfo(2) */
++	CALL(PM_GETSYSINFO)	= do_getsysinfo,	/* getsysinfo(2) */
++    CALL(PM_GETLCAPID)	= do_getlcapid
+ };
